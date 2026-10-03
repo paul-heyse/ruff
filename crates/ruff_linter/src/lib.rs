@@ -94,3 +94,6 @@ mod tests {
         assert_eq!(fixed.source_code(), code);
     }
 }
+
+/// Owned lexical observations from the existing semantic traversal.
+pub mod semantic_facts;

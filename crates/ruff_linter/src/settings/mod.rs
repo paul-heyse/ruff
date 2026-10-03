@@ -793,6 +793,11 @@ impl LinterSettings {
     }
 
     pub fn new(project_root: &Path) -> Self {
+        Self::new_with_src(project_root, vec![fs::get_cwd().to_path_buf(), fs::get_cwd().join("src")])
+    }
+
+    /// Construct from explicit source roots without reading the process working directory.
+    pub fn new_with_src(project_root: &Path, src: Vec<PathBuf>) -> Self {
         Self {
             exclude: FilePatternSet::default(),
             unresolved_target_version: TargetVersion(None),
@@ -816,7 +821,7 @@ impl LinterSettings {
             per_file_ignores: CompiledPerFileIgnoreList::default(),
             fix_safety: FixSafetyTable::default(),
 
-            src: vec![fs::get_cwd().to_path_buf(), fs::get_cwd().join("src")],
+            src,
             // Needs duplicating
             tab_size: IndentWidth::default(),
             line_length: LineLength::default(),
