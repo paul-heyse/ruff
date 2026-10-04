@@ -94,6 +94,7 @@ pub struct InteriorNode {
 
 #[derive(Debug, PartialEq, Eq, get_size2::GetSize)]
 pub struct NarrowingConstraints {
+    precision_lost: bool,
     used_interiors: Box<[InteriorNode]>,
     used_indices: Option<RankBitBox>,
 }
@@ -105,9 +106,15 @@ impl NarrowingConstraints {
     /// [`NarrowingConstraintsBuilder`].
     pub fn from_test_nodes(nodes: Vec<InteriorNode>) -> Self {
         Self {
+            precision_lost: false,
             used_interiors: nodes.into_boxed_slice(),
             used_indices: None,
         }
+    }
+
+    /// Whether an existing resource-limit fallback dropped narrowing in this scope.
+    pub const fn precision_lost(&self) -> bool {
+        self.precision_lost
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -131,6 +138,7 @@ impl NarrowingConstraints {
 
 #[derive(Debug, Default)]
 pub struct NarrowingConstraintsBuilder {
+    precision_lost: bool,
     interiors: InternedNodes<ScopedNarrowingConstraint, InteriorNode>,
     interior_used: RankBitBoxVec,
     and_cache: FxHashMap<
@@ -147,6 +155,7 @@ impl NarrowingConstraintsBuilder {
     pub(crate) fn build(self) -> NarrowingConstraints {
         if self.interior_used.first_zero().is_none() {
             NarrowingConstraints {
+                precision_lost: self.precision_lost,
                 used_interiors: self.interiors.into_nodes_boxed_slice(),
                 used_indices: None,
             }
@@ -159,6 +168,7 @@ impl NarrowingConstraintsBuilder {
                 .collect();
             let used_indices = RankBitBox::from_bits(self.interior_used);
             NarrowingConstraints {
+                precision_lost: self.precision_lost,
                 used_interiors,
                 used_indices: Some(used_indices),
             }
@@ -285,6 +295,7 @@ impl NarrowingConstraintsBuilder {
             return cached;
         }
         if self.interiors.len() >= MAX_INTERIOR_NODES {
+            self.precision_lost = true;
             return ALWAYS_TRUE;
         }
 
@@ -308,6 +319,7 @@ impl NarrowingConstraintsBuilder {
             return *cached;
         }
         if self.interiors.len() >= MAX_INTERIOR_NODES {
+            self.precision_lost = true;
             return ALWAYS_TRUE;
         }
 
@@ -365,6 +377,7 @@ impl NarrowingConstraintsBuilder {
             return *cached;
         }
         if self.interiors.len() >= MAX_INTERIOR_NODES {
+            self.precision_lost = true;
             return ALWAYS_TRUE;
         }
 
@@ -456,6 +469,58 @@ mod tests {
                     }
             }
         }
+    }
+
+    fn at_limit() -> NarrowingConstraintsBuilder {
+        let mut constraints = NarrowingConstraintsBuilder::default();
+        for index in 0..MAX_INTERIOR_NODES {
+            constraints.add_atom(predicate(index));
+        }
+        assert!(!constraints.precision_lost);
+        constraints
+    }
+
+    #[test]
+    fn precision_loss_marks_all_existing_fallbacks() {
+        let mut constraints = at_limit();
+        let a = constraints.add_atom(predicate(0));
+        let b = constraints.add_atom(predicate(1));
+        // Cached/terminal operations at the limit retain exactness.
+        assert_eq!(constraints.add_or_constraint(a, ALWAYS_FALSE), a);
+        assert!(!constraints.precision_lost);
+        assert_eq!(constraints.add_or_constraint(a, b), ALWAYS_TRUE);
+        assert!(constraints.precision_lost);
+        constraints.precision_lost = false;
+        assert_eq!(constraints.add_and_constraint(a, b), ALWAYS_TRUE);
+        assert!(constraints.precision_lost);
+        constraints.precision_lost = false;
+        assert_eq!(constraints.add_conditional(predicate(MAX_INTERIOR_NODES), a, b), ALWAYS_TRUE);
+        assert!(constraints.precision_lost);
+        // Subsequent exact shortcuts cannot erase an earlier fallback.
+        assert_eq!(constraints.add_and_constraint(ALWAYS_FALSE, a), ALWAYS_FALSE);
+        assert!(constraints.build().precision_lost()); // compacted branch: interiors unused
+    }
+
+    #[test]
+    fn precision_loss_survives_uncompacted_build_and_exact_controls() {
+        let mut constraints = at_limit();
+        let a = constraints.add_atom(predicate(0));
+        let b = constraints.add_atom(predicate(1));
+        constraints.add_or_constraint(a, b);
+        for index in 0..MAX_INTERIOR_NODES {
+            constraints.mark_used(ScopedNarrowingConstraint::new(index));
+        }
+        let built = constraints.build();
+        assert!(built.used_indices.is_none());
+        assert!(built.precision_lost());
+
+        let mut exact = NarrowingConstraintsBuilder::default();
+        let a = exact.add_atom(predicate(0));
+        let b = exact.add_atom(predicate(1));
+        let union = exact.add_or_constraint(a, b);
+        exact.mark_used(union);
+        assert!(!exact.build().precision_lost());
+        assert!(!NarrowingConstraints::from_test_nodes(vec![]).precision_lost());
     }
 
     #[test]

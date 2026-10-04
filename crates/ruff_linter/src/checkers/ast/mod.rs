@@ -249,6 +249,7 @@ pub(crate) struct Checker<'a> {
     /// Errors collected by the `semantic_checker`.
     semantic_errors: RefCell<Vec<SemanticSyntaxError>>,
     context: &'a LintContext<'a>,
+    observation: Option<&'a dyn crate::semantic_facts::Observer>,
 }
 
 impl<'a> Checker<'a> {
@@ -306,6 +307,7 @@ impl<'a> Checker<'a> {
             semantic_checker: SemanticSyntaxChecker::new(),
             semantic_errors: RefCell::default(),
             context,
+            observation: None,
         }
     }
 }
@@ -999,8 +1001,21 @@ impl SemanticSyntaxContext for Checker<'_> {
     }
 }
 
+impl Checker<'_> {
+    fn observation_active(&self) -> bool {
+        self.observation.as_ref().is_none_or(|observation| observation.is_active())
+    }
+
+    fn observation_checkpoint(&mut self) -> bool {
+        self.observation.is_none_or(|observation| observation.checkpoint())
+    }
+}
+
 impl<'a> Visitor<'a> for Checker<'a> {
     fn visit_stmt(&mut self, stmt: &'a Stmt) {
+        if !self.observation_checkpoint() {
+            return;
+        }
         // Step 0: Pre-processing
         self.semantic.push_node(stmt);
 
@@ -1710,6 +1725,9 @@ impl<'a> Visitor<'a> for Checker<'a> {
         // Step 3: Clean-up
 
         // Step 4: Analysis
+        if let Some(observation) = &self.observation {
+            observation.node(stmt.into(), &self.semantic, None);
+        }
         analyze::statement(stmt, self);
 
         self.semantic.flags = flags_snapshot;
@@ -1725,6 +1743,9 @@ impl<'a> Visitor<'a> for Checker<'a> {
     }
 
     fn visit_expr(&mut self, expr: &'a Expr) {
+        if !self.observation_checkpoint() {
+            return;
+        }
         self.with_semantic_checker(|semantic, context| semantic.visit_expr(expr, context));
 
         // Step 0: Pre-processing
@@ -2379,6 +2400,9 @@ impl<'a> Visitor<'a> for Checker<'a> {
         }
 
         self.semantic.flags = flags_snapshot;
+        if let Some(observation) = &self.observation {
+            observation.node(expr.into(), &self.semantic, Some(expr));
+        }
         analyze::expression(expr, self);
         self.semantic.pop_node();
     }
@@ -3503,6 +3527,30 @@ pub(crate) fn check_ast(
     target_version: TargetVersion,
     context: &LintContext,
 ) -> Vec<SemanticSyntaxError> {
+    check_ast_with_observation(
+        parsed, locator, stylist, indexer, noqa_line_for, settings, noqa, path, package,
+        source_type, cell_offsets, notebook_index, target_version, context, None,
+    ).0
+}
+
+#[expect(clippy::too_many_arguments)]
+pub(crate) fn check_ast_with_observation<'a>(
+    parsed: &'a Parsed<ModModule>,
+    locator: &'a Locator<'a>,
+    stylist: &'a Stylist<'a>,
+    indexer: &'a Indexer,
+    noqa_line_for: &'a NoqaMapping,
+    settings: &'a LinterSettings,
+    noqa: flags::Noqa,
+    path: &'a Path,
+    package: Option<PackageRoot<'a>>,
+    source_type: PySourceType,
+    cell_offsets: Option<&'a CellOffsets>,
+    notebook_index: Option<&'a NotebookIndex>,
+    target_version: TargetVersion,
+    context: &'a LintContext<'a>,
+    observation: Option<crate::semantic_facts::Observation<'_>>,
+) -> (Vec<SemanticSyntaxError>, Result<crate::semantic_facts::TraversalStats, crate::semantic_facts::Incomplete>) {
     let module_path = package
         .map(PackageRoot::path)
         .and_then(|package| to_module_path(package, path));
@@ -3526,6 +3574,7 @@ pub(crate) fn check_ast(
     };
 
     let allocator = typed_arena::Arena::new();
+    let observation = observation.map(RefCell::new);
     let mut checker = Checker::new(
         parsed,
         &allocator,
@@ -3544,35 +3593,63 @@ pub(crate) fn check_ast(
         target_version,
         context,
     );
+    checker.observation = observation.as_ref().map(|value| value as &dyn crate::semantic_facts::Observer);
     // Iterate over the AST.
     checker.visit_module(parsed.suite());
-    checker.visit_body(parsed.suite());
+    if checker.observation_active() {
+        checker.visit_body(parsed.suite());
+    }
 
     // Visit any deferred syntax nodes. Take care to visit in order, such that we avoid adding
     // new deferred nodes after visiting nodes of that kind. For example, visiting a deferred
     // function can add a deferred lambda, but the opposite is not true.
-    checker.visit_deferred();
-    checker.visit_exports();
+    if checker.observation_active() {
+        checker.visit_deferred();
+    }
+    if checker.observation_active() {
+        checker.visit_exports();
+    }
 
     // Check docstrings, bindings, and unresolved references.
-    analyze::deferred_lambdas(&mut checker);
-    analyze::deferred_for_loops(&mut checker);
-    analyze::deferred_comprehensions(&mut checker);
-    analyze::definitions(&mut checker);
-    analyze::bindings(&checker);
-    analyze::unresolved_references(&checker);
-    analyze::deferred_with_statements(&mut checker);
+    if checker.observation_active() {
+        analyze::deferred_lambdas(&mut checker);
+    }
+    if checker.observation_active() {
+        analyze::deferred_for_loops(&mut checker);
+    }
+    if checker.observation_active() {
+        analyze::deferred_comprehensions(&mut checker);
+    }
+    if checker.observation_active() {
+        analyze::definitions(&mut checker);
+    }
+    if checker.observation_active() {
+        analyze::bindings(&checker);
+    }
+    if checker.observation_active() {
+        analyze::unresolved_references(&checker);
+    }
+    if checker.observation_active() {
+        analyze::deferred_with_statements(&mut checker);
+    }
 
     // Reset the scope to module-level, and check all consumed scopes.
     checker.semantic.scope_id = ScopeId::global();
     checker.analyze.scopes.push(ScopeId::global());
-    analyze::deferred_scopes(&checker);
+    if checker.observation_active() {
+        analyze::deferred_scopes(&checker);
+    }
 
-    let Checker {
-        semantic_errors, ..
-    } = checker;
-
-    semantic_errors.into_inner()
+    if let Some(observation) = &checker.observation {
+        observation.finish(&checker.semantic, locator.contents());
+    }
+    let semantic_errors = std::mem::take(checker.semantic_errors.get_mut());
+    drop(checker);
+    let observation_result = observation.map_or_else(
+        || Ok(crate::semantic_facts::TraversalStats::default()),
+        |value| value.into_inner().into_result(),
+    );
+    (semantic_errors, observation_result)
 }
 
 /// A type for collecting diagnostics in a given file.
